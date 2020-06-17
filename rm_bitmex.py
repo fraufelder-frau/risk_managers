@@ -16,6 +16,7 @@ home = str(Path.home())+'/'
 from bitmex_websocket import BitMEXWebsocket
 import decimal
 import requests
+import json
 
 
 def input_price(client, dialogue, valid_ticks):
@@ -317,7 +318,7 @@ def float_range(start, stop, step):
 def amend_order(symbol):
     new_stop = input_price(client, 'Enter New Stop Price or 0 to Skip', valid_ticks)
     new_target = input_price(client, 'Enter New Target Price or 0 to Skip', valid_ticks)
-    stop = [x for x in ws.open_orders('') if x['stopPx'] is not None and x['symbol'] == symbol]
+    stop = [x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == '' and x['symbol'] == symbol]
     if len(stop) > 0:
         stopID = stop[0]['orderID']
     close = [x for x in ws.open_orders('') if x['price'] is not None and x['symbol'] == symbol]
@@ -402,6 +403,8 @@ def new_trade_params(symbol):
 
 def new_trade(trade_params):
     contract = trade_params['contract']
+    print('Updating Leverage to Cross'+'\n')
+    client.Position.Position_updateLeverage(symbol=contract, leverage=0).result()
     if trade_params['side'] == 'Short':
         size = trade_params['size']*-1
     else:
@@ -495,7 +498,7 @@ def reward_amount_XBT(trade_params):
 def current_open(symbol):
     open_position = [x for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True]
     try:
-        stop_price = usd_str([x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None][0])
+        stop_price = usd_str([x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == ''][0])
     except (IndexError, KeyError, TypeError):
         stop_price = 'No Stop Set'
     try:
@@ -527,7 +530,7 @@ def current_open(symbol):
 
 def all_open():
     positions = []
-    open_contracts = [x['symbol']  for x in ws.positions() if x['isOpen'] == True]
+    open_contracts = [x['symbol'] for x in ws.positions() if x['isOpen'] == True]
     for x in open_contracts:
         positions.append(current_open(x))
     return positions
@@ -550,12 +553,92 @@ def take_profit_order(symbol, take_profit):
     return print('\n'+'Updated Positions'+'\n'+'\n')
 
 
+def price_alarms():
+    contracts = [x['symbol'] for x in client.Position.Position_get(filter = json.dumps({'isOpen': True})).result()[0]]
+    symbol = list_prompt('Choose Contract to Track', contracts)
+    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
+
+    alarm_types = []
+    if len([x['price'] for x in ws.open_orders('') if x['price'] is not None]) > 0:
+        alarm_types.append('Target')
+    if len([x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == '']) > 0:
+        alarm_types.append('Stop')
+    alarm = [list_prompt('Choose Alert Type', alarm_types)]
+    alarm_types = [x for x in alarm_types if x not in alarm]
+    while True:
+        if len(alarm_types) > 0:
+            print('Set Another Alarm?')
+            resp = y_n_prompt()
+            if resp == 'No':
+                alarm = alarm[0]
+                break
+            else:
+                alarm.append(list_prompt('Choose Alert Type', alarm_types))
+                alarm_types = [x for x in alarm_types if x not in alarm]
+                continue
+        else:
+            break
+
+    target_alarm = False
+    stop_alarm = False
+    if 'Target' in alarm:
+        target_price = [x['price'] for x in ws.open_orders('') if x['price'] is not None][0]
+        target_alarm = True
+    if 'Stop' in alarm:
+        stop_price = [x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == ''][0]
+        stop_alarm = True
+    current_price = ws.recent_trades()[-1]['price']
+    set_price = current_price
+    msg = symbol+' Alerts'+'\n'+'\n'
+    msg += 'Current Price: '+usd_str(set_price)+'\n'
+    if target_alarm:
+        msg += 'Target Alarm Set at '+usd_str(target_price)+'\n'
+    if stop_alarm:
+        msg += 'Stop Alarm Set at '+usd_str(stop_price)
+    telegram_sendText(bot_credentials, msg)
+    while target_alarm or stop_alarm:
+        current_price = ws.recent_trades()[-1]['price']
+        if target_alarm:
+            if target_price > set_price:
+                if current_price >= target_price:
+                    telegram_sendText(bot_credentials, symbol+' Target Price Hit')
+                    target_alarm = False
+            else:
+                if current_price <= target_price:
+                    telegram_sendText(bot_credentials, symbol+' Target Price Hit')
+                    target_alarm = False
+        if stop_alarm:
+            if stop_price > set_price:
+                if current_price >= stop_price:
+                    telegram_sendText(bot_credentials, symbol+' Stop Price Hit')
+                    stop_alarm = False
+            else:
+                if current_price <= stop_price:
+                    telegram_sendText(bot_credentials, symbol+' Stop Price Hit')
+                    stop_alarm = False
+        time.sleep(0.5)
+        continue
+    telegram_sendText(bot_credentials, symbol+' Alerts Cleared')
+    return print(symbol+' Alerts Cleared')
+
+
 print('Begin Risk Manager')
 while True:
     file = home+'credentials.pickle'
     exchanges = ['Bitmex', 'Exit']
     exchange = list_prompt('Choose an Exchange', exchanges)
     if exchange == 'Exit':
+        if master_credentials:
+            print('Set Price Alerts?')
+            resp = y_n_prompt()
+            if resp == 'Yes':
+                try:
+                    price_alarms()
+                except KeyboardInterrupt:
+                    print('Alarms Canceled'+'\n'+'Exiting Program')
+            else:
+                print('Exiting Program')
+            break
         print('Exiting Program')
         break
     if os.path.exists(file) == False:

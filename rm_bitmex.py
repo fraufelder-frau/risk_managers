@@ -17,6 +17,7 @@ from bitmex_websocket import BitMEXWebsocket
 import decimal
 import requests
 import json
+import websocket
 
 
 def input_price(client, dialogue, valid_ticks):
@@ -496,6 +497,7 @@ def reward_amount_XBT(trade_params):
 
 
 def current_open(symbol):
+    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
     open_position = [x for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True]
     try:
         stop_price = usd_str([x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == ''][0])
@@ -550,7 +552,8 @@ def take_profit_order(symbol, take_profit):
     if new_stop != 0:
         client.Order.Order_new(symbol=symbol, stopPx=new_stop, execInst=str('LastPrice, ReduceOnly'), orderQty=(new_size*-1), ordType='Stop').result()
         print('Stop for '+symbol+' Set to '+usd_str(new_stop))
-    return print('\n'+'Updated Positions'+'\n'+'\n')
+    
+    return print('\n'+'Updated Positions'+'\n'+'\n'+results_str(current_open(symbol)))
 
 
 def remove_duplicates(list_item):
@@ -565,11 +568,11 @@ def price_alarms():
     ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
     my_orders = [x for x in ws.open_orders('') if x['symbol'] == symbol]
     alarm_types = []
-    if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] != 'Limit']) > 0:
+    if len([x['price'] for x in my_orders if x['price'] is not None and x['execInst'] == 'ReduceOnly']) > 0:
         alarm_types.append('Target')
     if len([x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None]) > 0:
         alarm_types.append('Stop')
-    if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['triggered'] == '']) > 0:
+    if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['execInst'] != 'ReduceOnly' and x['triggered'] == '']) > 0:
         alarm_types.append('Entry')
     alarm = [list_prompt('Choose Alert Type', alarm_types+['All'])]
     alarm_types = [x for x in alarm_types if x not in alarm]
@@ -594,13 +597,13 @@ def price_alarms():
     stop_alarm = False
     entry_alarm = False
     if 'Target' in alarm:
-        target_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] != 'Limit'][0]
+        target_price = [x['price'] for x in my_orders if x['price'] is not None and x['execInst'] == 'ReduceOnly'][0]
         target_alarm = True
     if 'Stop' in alarm:
         stop_price = [x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None][0]
         stop_alarm = True
     if 'Entry' in alarm:
-        entry_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['triggered'] == ''][0]
+        entry_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['execInst'] != 'ReduceOnly' and x['triggered'] == ''][0]
         entry_alarm = True
     current_price = ws.recent_trades()[-1]['price']
     set_price = current_price
@@ -793,11 +796,14 @@ while True:
                     close_position(new_trade_data['contract'])
                     new_trade(new_trade_data)
                     if bot:
+                        while True:
+                            try:
+                                [x for x in ws.positions() if x['symbol'] == contract and x['isOpen'] == True][0]
+                            except IndexError:
+                                time.sleep(0.5)
+                                continue
                         msg = 'Updated Position'+'\n'+'\n'
-                        myposition = current_open(new_trade_data['contract'])
-                        if type(myposition) == dict:
-                            myposition = results_str(myposition)
-                        msg += myposition
+                        msg+= results_str(current_open(new_trade_data['contract']))
                         telegram_sendText(bot_credentials, msg);
                     continue
 

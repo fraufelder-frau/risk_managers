@@ -15,7 +15,6 @@ import bravado.exception
 import sys
 from pathlib import Path
 home = str(Path.home())+'/'
-from bitmex_websocket import BitMEXWebsocket
 
 def y_n_prompt():
     while True:
@@ -286,101 +285,126 @@ while True:
         client = QtradeAPI('https://api.qtrade.io', key=final_user[exchange]['api_key'])
     
     bot_credentials = (final_user['bot']['bot_token'],final_user['bot']['bot_chatID'])
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol='XBTUSD', api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-    contracts = [x['symbol'] for x in ws.open_orders('')]
-    contracts = remove_duplicates(contracts)
-    symbol = list_prompt('Choose Contract to Track', contracts)
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
     break
 
 
-my_orders = [x for x in ws.open_orders('') if x['symbol'] == symbol]
-alarm_types = []
-if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] != 'Limit']) > 0:
-    alarm_types.append('Target')
-if len([x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None]) > 0:
-    alarm_types.append('Stop')
-if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['triggered'] == '']) > 0:
-    alarm_types.append('Entry')
-alarm = [list_prompt('Choose Alert Type', alarm_types+['All'])]
-alarm_types = [x for x in alarm_types if x not in alarm]
-if alarm[0] == 'All':
-    alarm = alarm_types
-else:
-    while True:
-        if len(alarm_types) > 0:
-            print('Set Another Alarm?')
-            resp = y_n_prompt()
-            if resp == 'No':
-                alarm = alarm[0]
-                break
-            else:
-                alarm.append(list_prompt('Choose Alert Type', alarm_types))
-                alarm_types = [x for x in alarm_types if x not in alarm]
-                continue
-        else:
+while True:
+    try:
+        client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0][0]
+    except IndexError:
+        set_alerts = False
+        break
+    else:
+        my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0]
+        contracts = [x['symbol'] for x in my_orders if 'XBT' in x['symbol']]
+        contracts = remove_duplicates(contracts)
+        if len(contracts) == 0:
+            set_alerts = False
             break
-
-target_alarm = False
-stop_alarm = False
-entry_alarm = False
-if 'Target' in alarm:
-    target_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] != 'Limit'][0]
-    target_alarm = True
-if 'Stop' in alarm:
-    stop_price = [x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None][0]
-    stop_alarm = True
-if 'Entry' in alarm:
-    entry_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['triggered'] == ''][0]
-    entry_alarm = True
-current_price = ws.recent_trades()[-1]['price']
-set_price = current_price
-msg = symbol+' Alerts'+'\n'+'\n'+'Account: '+account+'\n'
-msg += 'Current Price: '+usd_str(set_price)+'\n'
-if entry_alarm:
-    msg += 'Entry Alarm Set at '+usd_str(entry_price)+'\n'
-if target_alarm:
-    msg += 'Target Alarm Set at '+usd_str(target_price)+'\n'
-if stop_alarm:
-    msg += 'Stop Alarm Set at '+usd_str(stop_price)
-telegram_sendText(bot_credentials, msg)
-ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-while target_alarm or stop_alarm or entry_alarm:
-    current_price = ws.recent_trades()[-1]['price']
-    if target_alarm:
-        if target_price > set_price:
-            if current_price >= target_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                target_alarm = False
-        else:
-            if current_price <= target_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                target_alarm = False
-    if stop_alarm:
-        if stop_price > set_price:
-            if current_price >= stop_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                stop_alarm = False
-        else:
-            if current_price <= stop_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                stop_alarm = False
+        symbol = list_prompt('Choose Contract to Track', contracts)
+        set_alerts = True
+        break
+if set_alerts:
+    try:
+        entry_price = [x['price'] for x in my_orders if x['price'] is not None and 'ReduceOnly' not in x['execInst']][0]
+    except IndexError:
+        entry_price = None
+    try:
+        stop_price = [x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        stop_price = None
+    try:
+        target_price = [x['price'] for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        target_price = None
+    alarm_types = []
+    if entry_price is not None:
+        alarm_types.append('Entry')
+    if stop_price is not None:
+        alarm_types.append('Stop')
+    if target_price is not None:
+        alarm_types.append('Target')
+    alarm = [list_prompt('Choose Alert Type', alarm_types+['All'])]
+    alarm_types = [x for x in alarm_types if x not in alarm]
+    if alarm[0] == 'All':
+        alarm = alarm_types
+    else:
+        while True:
+            if len(alarm_types) > 0:
+                print('Set Another Alarm?')
+                resp = y_n_prompt()
+                if resp == 'No':
+                    alarm = alarm[0]
+                    break
+                else:
+                    alarm.append(list_prompt('Choose Alert Type', alarm_types))
+                    alarm_types = [x for x in alarm_types if x not in alarm]
+                    continue
+            else:
+                break
+    target_alarm = False
+    stop_alarm = False
+    entry_alarm = False
+    if 'Entry' in alarm:
+        entry_alarm = True
+    if 'Stop' in alarm:
+        stop_alarm = True
+    if 'Target' in alarm:
+        target_alarm = True
+    current_price = [x['lastPrice'] for x in requests.get('https://www.bitmex.com/api/v1/instrument/active').json() if x['symbol'] == symbol][0]
+    set_price = current_price
+    msg = symbol+' Alerts'+'\n'+'\n'+'Account: '+account+'\n'
+    msg += 'Current Price: '+usd_str(set_price)+'\n'
     if entry_alarm:
-        if entry_price > set_price:
-            if current_price >= entry_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                msg += results_str(current_open(symbol))
-                telegram_sendText(bot_credentials, msg);
-                entry_alarm = False
+        msg += 'Entry Alarm Set at '+usd_str(entry_price)+'\n'
+    if target_alarm:
+        msg += 'Target Alarm Set at '+usd_str(target_price)+'\n'
+    if stop_alarm:
+        msg += 'Stop Alarm Set at '+usd_str(stop_price)
+    telegram_sendText(bot_credentials, msg)
+    while target_alarm or stop_alarm or entry_alarm:
+        data = requests.get('https://www.bitmex.com/api/v1/instrument/active')
+        current_price = [x['lastPrice'] for x in data.json() if x['symbol'] == symbol][0]
+        if int(data.headers['x-ratelimit-remaining']) < 5:
+            sleep_time = 30
         else:
-            if current_price <= entry_price:
-                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                msg += results_str(current_open(symbol))
-                telegram_sendText(bot_credentials, msg);
-                entry_alarm = False
-    time.sleep(0.2)
-    continue
-telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Alerts Cleared')
+            sleep_time = 1
+        if target_alarm:
+            if target_price > set_price:
+                if current_price >= target_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
+                    target_alarm = False
+            else:
+                if current_price <= target_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
+                    target_alarm = False
+        if stop_alarm:
+            if stop_price > set_price:
+                if current_price >= stop_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
+                    stop_alarm = False
+            else:
+                if current_price <= stop_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
+                    stop_alarm = False
+        if entry_alarm:
+            if entry_price > set_price:
+                if current_price >= entry_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
+                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
+                    msg += results_str(current_open(symbol))
+                    telegram_sendText(bot_credentials, msg);
+                    entry_alarm = False
+            else:
+                if current_price <= entry_price:
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
+                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
+                    msg += results_str(current_open(symbol))
+                    telegram_sendText(bot_credentials, msg);
+                    entry_alarm = False
+        time.sleep(sleep_time)
+    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Alerts Cleared')
+    print('Account: '+account+'\n'+symbol+' Alerts Cleared')
+else:
+    print('No Open Orders')
 

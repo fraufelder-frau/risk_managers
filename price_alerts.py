@@ -288,35 +288,38 @@ while True:
     break
 
 
-while True:
-    try:
-        client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0][0]
-    except IndexError:
+my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0]
+if len(my_orders) == 0:
+    set_alerts = False
+else:
+    contracts = [x['symbol'] for x in my_orders if 'XBT' in x['symbol']]
+    contracts = remove_duplicates(contracts)
+    if len(contracts) == 0:
         set_alerts = False
-        break
-    else:
-        my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0]
-        contracts = [x['symbol'] for x in my_orders if 'XBT' in x['symbol']]
-        contracts = remove_duplicates(contracts)
-        if len(contracts) == 0:
-            set_alerts = False
-            break
-        symbol = list_prompt('Choose Contract to Track', contracts)
-        set_alerts = True
-        break
+    symbol = list_prompt('Choose Contract to Track', contracts)
+    set_alerts = True
 if set_alerts:
     try:
-        entry_price = [x['price'] for x in my_orders if x['price'] is not None and 'ReduceOnly' not in x['execInst']][0]
+        entry_order = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' not in x['execInst']][0]
     except IndexError:
         entry_price = None
+    else:
+        entry_price = entry_order['price']
+        entryID = entry_order['orderID']
     try:
-        stop_price = [x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
+        stop_order = [x for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
     except IndexError:
         stop_price = None
+    else:
+        stop_price = stop_order['stopPx']
+        stopID = stop_order['orderID']
     try:
-        target_price = [x['price'] for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
+        target_order = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
     except IndexError:
         target_price = None
+    else:
+        target_price = target_order['price']
+        targetID = target_order['orderID']
     alarm_types = []
     if entry_price is not None:
         alarm_types.append('Entry')
@@ -352,9 +355,8 @@ if set_alerts:
     if 'Target' in alarm:
         target_alarm = True
     current_price = [x['lastPrice'] for x in requests.get('https://www.bitmex.com/api/v1/instrument/active').json() if x['symbol'] == symbol][0]
-    set_price = current_price
     msg = symbol+' Alerts'+'\n'+'\n'+'Account: '+account+'\n'
-    msg += 'Current Price: '+usd_str(set_price)+'\n'
+    msg += 'Current Price: '+usd_str(current_price)+'\n'
     if entry_alarm:
         msg += 'Entry Alarm Set at '+usd_str(entry_price)+'\n'
     if target_alarm:
@@ -363,46 +365,39 @@ if set_alerts:
         msg += 'Stop Alarm Set at '+usd_str(stop_price)
     telegram_sendText(bot_credentials, msg)
     while target_alarm or stop_alarm or entry_alarm:
-        data = requests.get('https://www.bitmex.com/api/v1/instrument/active')
-        current_price = [x['lastPrice'] for x in data.json() if x['symbol'] == symbol][0]
-        if int(data.headers['x-ratelimit-remaining']) < 5:
-            sleep_time = 30
-        else:
-            sleep_time = 1
+        try:
+            my_orders = client.Order.Order_getOrders(reverse = True, filter = json.dumps({'symbol': symbol})).result()[0]
+        except bravado.exception.HTTPBadRequest:
+            continue
+        if len(my_orders) == 0:
+            target_alarm = False
+            stop_alarm = False
+            entry_alarm = False
         if target_alarm:
-            if target_price > set_price:
-                if current_price >= target_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                    target_alarm = False
-            else:
-                if current_price <= target_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                    target_alarm = False
+            target_status = [x for x in my_orders if x['orderID'] == targetID][0]['ordStatus']
+            if target_status == 'Filled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Order Filled')
+                target_alarm = False
+            elif target_status == 'Canceled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Order Canceled')
+                target_alarm = False
         if stop_alarm:
-            if stop_price > set_price:
-                if current_price >= stop_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                    stop_alarm = False
-            else:
-                if current_price <= stop_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                    stop_alarm = False
+            stop_status = [x for x in my_orders if x['orderID'] == stopID][0]['ordStatus']
+            if stop_status == 'Filled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Order Filled')
+                stop_alarm = False
+            elif stop_status == 'Canceled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Order Canceled')
+                stop_alarm = False
         if entry_alarm:
-            if entry_price > set_price:
-                if current_price >= entry_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                    msg += results_str(current_open(symbol))
-                    telegram_sendText(bot_credentials, msg);
-                    entry_alarm = False
-            else:
-                if current_price <= entry_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                    msg += results_str(current_open(symbol))
-                    telegram_sendText(bot_credentials, msg);
-                    entry_alarm = False
-        time.sleep(sleep_time)
+            entry_status = [x for x in my_orders if x['orderID'] == entryID][0]['ordStatus']
+            if entry_status == 'Filled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Order Filled')
+                entry_alarm = False
+            elif entry_status == 'Canceled':
+                telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Order Canceled')
+                entry_alarm = False
+        time.sleep(1)
     telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Alerts Cleared')
     print('Account: '+account+'\n'+symbol+' Alerts Cleared')
 else:

@@ -13,11 +13,9 @@ import bravado.exception
 import sys
 from pathlib import Path
 home = str(Path.home())+'/'
-from bitmex_websocket import BitMEXWebsocket
 import decimal
 import requests
 import json
-import websocket
 
 
 def input_price(client, dialogue, valid_ticks):
@@ -316,74 +314,81 @@ def float_range(start, stop, step):
         start += decimal.Decimal(step)
 
 
-def amend_order(symbol):
+def amend_position(symbol):
     new_stop = input_price(client, 'Enter New Stop Price or 0 to Skip', valid_ticks)
     new_target = input_price(client, 'Enter New Target Price or 0 to Skip', valid_ticks)
-    stop = [x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == '' and x['symbol'] == symbol]
-    if len(stop) > 0:
-        stopID = stop[0]['orderID']
-    close = [x for x in ws.open_orders('') if x['price'] is not None and x['symbol'] == symbol]
-    if len(close) > 0:
-        closeID = close[0]['orderID']
-    qty = [x['currentQty'] for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True][0]
+    my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true', 'symbol': symbol})).result()[0]
+    try:
+        stop = [x for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        stop = None
+    if stop is not None:
+        stopID = stop['orderID']
+    try:
+        close = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        close = None
+    if close is not None:
+        closeID = close['orderID']
+    current_bitmex = client.Position.Position_get(filter=json.dumps({'symbol': symbol})).result()[0]
+    qty = [x['currentQty'] for x in current_bitmex if x['symbol'] == symbol and x['isOpen'] == True][0]
     orderQty = qty*-1
     if new_stop != 0:
-        if len(stop) > 0:
+        if stop is not None:
             client.Order.Order_amend(orderID=stopID, stopPx=new_stop).result()
             print('Stop for '+symbol+' Amended to '+usd_str(new_stop))
-        elif len(stop) == 0:
+        else:
             client.Order.Order_new(symbol=symbol, stopPx=new_stop, execInst=str('LastPrice, ReduceOnly'), orderQty=orderQty, ordType='Stop').result()
             print('Stop for '+symbol+' Set to '+usd_str(new_stop))
     else:
         print('Stop Unchanged')
     if new_target != 0 :
-        if len(close) > 0:
+        if close is not None:
             client.Order.Order_amend(orderID=closeID, price=new_target).result()
             print('Target for '+symbol+' Amended to '+usd_str(new_target))
-        elif len(close) == 0:
+        else:
             client.Order.Order_new(symbol=symbol, price=new_target, execInst='ReduceOnly', orderQty=orderQty, ordType='Limit').result()
             print('Target for '+symbol+' Set to '+usd_str(new_target))
     else:
         print('Target Unchanged')
     if new_stop or new_target != 0:
-        if bot:
-            msg = 'Updated Position'+'\n'+'\n'
-            myposition = current_open(symbol)
-            if type(myposition) == dict:
-                myposition = results_str(myposition)
-            msg += myposition
-            telegram_sendText(bot_credentials, msg);
-    return print('\n'+'Updated Positions'+'\n'+'\n'+results_str(current_open(symbol)))
+        return print('\n'+'Updated Positions'+'\n'+'\n'+results_str(current_open(symbol)))
+    else:
+        return print('No Changes Made')
 
 
 def close_position(symbol):
-    resp = [x for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True]
-    if len(resp) > 0:
-        resp = resp[0]
+    resp = client.Position.Position_get(filter=json.dumps({'isOpen': True, 'symbol': symbol})).result()[0]
+    if len(resp) == 0:
+        return print('No '+symbol+' Position To Close')
+    else:
         if resp['currentQty'] > 0:
             client.Order.Order_new(symbol=symbol, execInst='Close', side='Sell').result()
         else:
             client.Order.Order_new(symbol=symbol, execInst='Close', side='Buy').result()
+        my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true', 'symbol': symbol})).result()[0]
+        if len(my_orders) != 0:
+            client.Order.Order_cancelAll(symbol=contract).result()
         return print(symbol+' Position Closed')
-    else:
-        return print('No '+symbol+' Position To Close')
 
 
 def new_trade_params(symbol):
+    balance = client.User.User_getWallet().result()[0]['amount']/100000000
+    symbol_data = [x for x in client.Instrument.Instrument_getActive().result()[0] if x['symbol'] == symbol][0]
     new_trade_data = {'contract': symbol,
-                      'balance': ws.funds()['marginBalance']/100000000,
+                      'balance': balance,
                       'order_type': list_prompt('Choose Order Type for Entry', order_types),
                      'stop': input_price(client, 'Enter Stop Price', valid_ticks),
                      'target': input_price(client, 'Enter Target Price', valid_ticks),
-                      'makerFee': ws.get_instrument()['makerFee'],
-                      'takerFee': ws.get_instrument()['takerFee']}
+                      'makerFee': symbol_data['makerFee'],
+                      'takerFee': symbol_data['takerFee']}
     if new_trade_data['order_type'] == 'Limit':
         new_trade_data['entry'] = input_price(client, 'Enter Entry Price', valid_ticks)
     else:
         if new_trade_data['stop'] > new_trade_data['target']:
-            new_trade_data['entry'] =  ws.get_instrument()['bidPrice']
+            new_trade_data['entry'] =  symbol_data['bidPrice']
         else:
-            new_trade_data['entry'] =  ws.get_instrument()['askPrice']
+            new_trade_data['entry'] =  symbol_data['askPrice']
     while True:
         try:
             risk = float(input('Account Percent Risk'+'\n'+'> '))
@@ -427,11 +432,11 @@ def new_trade(trade_params):
             stop_limit_trigger = float(float(entry)-0.5)
         client.Order.Order_new(symbol=contract, stopPx=stop_limit_trigger, price=target, execInst=str('LastPrice, ReduceOnly'), orderQty=(size*-1), ordType='StopLimit').result()
         client.Order.Order_new(symbol=contract, stopPx=stop, execInst=str('LastPrice, ReduceOnly'), orderQty=(size*-1), ordType='Stop').result()
-    return current_open(trade_params['contract'])
+    return print('Orders Placed')
 
 
 def position_size(trade_params):
-    balance = ws.funds()['marginBalance']/100000000
+    balance = client.User.User_getWallet().result()[0]['amount']/100000000
     entry_value = 1/trade_params['entry']
     stop_value = 1/trade_params['stop']
     x = symbols('x')
@@ -454,6 +459,7 @@ def position_size(trade_params):
 
 def risk_dict(trade_params):
     temp = {'Contract': trade_params['contract'],
+            'Account': account,
             'Balance': trade_params['balance'],
             'Side': trade_params['side'],
             'Size': trade_params['size'],
@@ -480,6 +486,8 @@ def risk_amount_XBT(trade_params):
         entry_fee = trade_params['takerFee']
     risk_amount = (trade_params['size']*(entry_value - stop_value))+((trade_params['size']*entry_value*entry_fee)+(trade_params['size']*stop_value*trade_params['takerFee']))
     risk_amount = float(round(risk_amount, 8))
+    if trade_params['entry'] < trade_params['stop']:
+        risk_amount = risk_amount*-1
     return risk_amount
 
 def reward_amount_XBT(trade_params):
@@ -497,21 +505,22 @@ def reward_amount_XBT(trade_params):
 
 
 def current_open(symbol):
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-    open_position = [x for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True]
-    try:
-        stop_price = usd_str([x['stopPx'] for x in ws.open_orders('') if x['stopPx'] is not None and x['triggered'] == ''][0])
-    except (IndexError, KeyError, TypeError):
-        stop_price = 'No Stop Set'
-    try:
-        target_price = usd_str([x['price'] for x in ws.open_orders('') if x['price'] is not None][0])
-    except (IndexError, KeyError, TypeError):
-        target_price = 'No Target Set'
-    if len(open_position) > 0:
-        open_position = open_position[0]
+    open_position = client.Position.Position_get(filter=json.dumps({'isOpen': True, 'symbol': symbol})).result()[0][0]
+    if len(open_position) == 0:
+        return print('No Open Position')
+    else:
+        my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true', 'symbol': symbol})).result()[0]
+        try:
+            stop_price = usd_str([x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0])
+        except (IndexError, KeyError, TypeError):
+            stop_price = 'No Stop Set'
+        try:
+            target_price = usd_str([x['price'] for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0])
+        except (IndexError, KeyError, TypeError):
+            target_price = 'No Target Set'
         temp = {'Exchange': exchange,
                 'Account': account,
-                'Balance': ws.funds()['marginBalance']/100000000,
+                'Balance': client.User.User_getWallet().result()[0]['amount']/100000000,
                 'Timestamp': datetime.strftime(datetime.utcnow(), '%m-%d-%Y %H:%M:%S'),
                 'Contract': symbol
                }
@@ -523,36 +532,66 @@ def current_open(symbol):
         temp['Entry'] = usd_str(open_position['avgEntryPrice'])
         temp['Stop'] = stop_price
         temp['Target'] = target_price
-        temp['LastPrice'] = usd_str(ws.recent_trades()[-1]['price'])
-        temp['UnrealisedPnl'] = btc_str([x['unrealisedPnl']/100000000 for x in ws.positions() if x['symbol'] == symbol][0])
+        last_price = [y['lastPrice'] for y in requests.get('https://www.bitmex.com/api/v1/instrument/active').json() if symbol in y['symbol']][0]
+        temp['LastPrice'] = usd_str(last_price)
+        temp['UnrealisedPnl'] = btc_str(open_position['unrealisedPnl']/100000000)
         return temp
-    else:
-        return 'No Open Position'
 
 
 def all_open():
+    data = client.Position.Position_get(filter=json.dumps({'isOpen': True})).result()[0]
     positions = []
-    open_contracts = [x['symbol'] for x in ws.positions() if x['isOpen'] == True]
-    for x in open_contracts:
-        positions.append(current_open(x))
+    open_contracts = [x['symbol'] for x in data]
+    open_contracts = remove_duplicates(open_contracts)
+    if len(open_contracts) > 1:
+        for x in open_contracts:
+            positions.append(current_open(x))
+    else:
+        symbol = open_contracts[0]
+        positions = current_open(symbol)
     return positions
 
 
 def take_profit_order(symbol, take_profit):
+    my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true', 'symbol': symbol})).result()[0]
+    try:
+        stop_order = [x for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        stopID = None
+    else:
+        stop_price = stop_order['stopPx']
+        stopID = stop_order['orderID']
+    try:
+        target_order = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
+    except IndexError:
+        targetID = None
+    else:
+        target_price = target_order['price']
+        targetID = target_order['orderID']
     new_stop = input_price(client, 'Enter New Stop Price or 0 to Skip', valid_ticks)
     new_target = input_price(client, 'Enter New Target Price or 0 to Skip', valid_ticks)
-    open_position = [x for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True][0]
+    open_position = client.Position.Position_get(filter=json.dumps({'isOpen': True, 'symbol': symbol})).result()[0][0]
     take_profit_size = round(((open_position['currentQty']*(int(take_profit)/100))*-1), 0)
-    client.Order.Order_cancelAll(symbol=symbol).result()
     client.Order.Order_new(symbol=symbol, orderQty=take_profit_size, ordType='Market').result()
-    new_size = [x['currentQty'] for x in ws.positions() if x['symbol'] == symbol and x['isOpen'] == True][0]
+    new_size = client.Position.Position_get(filter=json.dumps({'isOpen': True, 'symbol': symbol})).result()[0][0]['currentQty']
     if new_target != 0:
-        client.Order.Order_new(symbol=symbol, price=new_target, execInst='ReduceOnly', orderQty=(new_size*-1), ordType='Limit').result()
+        target_exec_price = new_target
+    elif new_target == 0 and targetID is not None:
+        target_exec_price = target_price
+    else:
+        target_exec_price = None
+    if target_exec_price is not None:
+        client.Order.Order_new(symbol=symbol, price=exec_price, execInst='ReduceOnly', orderQty=(new_size*-1), ordType='Limit').result()
         print('Target for '+symbol+' Set to '+usd_str(new_target))
     if new_stop != 0:
-        client.Order.Order_new(symbol=symbol, stopPx=new_stop, execInst=str('LastPrice, ReduceOnly'), orderQty=(new_size*-1), ordType='Stop').result()
+        stop_exec_price = new_stop
+    elif new_stop == 0 and stopID is not None:
+        stop_exec_price = stop_price
+    else:
+        stop_exec_price = None
+    if stop_exec_price is not None:
+        client.Order.Order_amend(orderID=stopID, stopPx=stop_exec_price, orderQty=(new_size*-1)).result()
         print('Stop for '+symbol+' Set to '+usd_str(new_stop))
-    
     return print('\n'+'Updated Positions'+'\n'+'\n'+results_str(current_open(symbol)))
 
 
@@ -560,102 +599,127 @@ def remove_duplicates(list_item):
     return list(dict.fromkeys(list_item))
 
 
-def price_alarms():
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol='XBTUSD', api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-    contracts = [x['symbol'] for x in ws.open_orders('')]
-    contracts = remove_duplicates(contracts)
-    symbol = list_prompt('Choose Contract to Track', contracts)
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-    my_orders = [x for x in ws.open_orders('') if x['symbol'] == symbol]
-    alarm_types = []
-    if len([x['price'] for x in my_orders if x['price'] is not None and x['execInst'] == 'ReduceOnly']) > 0:
-        alarm_types.append('Target')
-    if len([x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None]) > 0:
-        alarm_types.append('Stop')
-    if len([x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['execInst'] != 'ReduceOnly' and x['triggered'] == '']) > 0:
-        alarm_types.append('Entry')
-    alarm = [list_prompt('Choose Alert Type', alarm_types+['All'])]
-    alarm_types = [x for x in alarm_types if x not in alarm]
-    if alarm[0] == 'All':
-        alarm = alarm_types
+def set_alerts():
+    master_credentials = pickle_load(file)
+    temp_bot = {k:v for k,v in master_credentials.items() if k == 'bots'}
+    bot_accounts = list(temp_bot['bots'].keys())
+    bot_account = list_prompt('Choose an Alert Bot', bot_accounts)
+    temp_bot = {k:v for k,v in temp_bot['bots'].items() if k == bot_account}
+    bot_credentials = (temp_bot[bot_account]['bot_token'], temp_bot[bot_account]['bot_chatID'])
+    my_orders = client.Order.Order_getOrders(filter = json.dumps({'open': 'true'})).result()[0]
+    if len(my_orders) == 0:
+        set_alerts = False
     else:
-        while True:
-            if len(alarm_types) > 0:
-                print('Set Another Alarm?')
-                resp = y_n_prompt()
-                if resp == 'No':
-                    alarm = alarm[0]
-                    break
+        contracts = [x['symbol'] for x in my_orders if 'XBT' in x['symbol']]
+        contracts = remove_duplicates(contracts)
+        if len(contracts) == 0:
+            set_alerts = False
+        symbol = list_prompt('Choose Contract to Track', contracts)
+        set_alerts = True
+    if set_alerts:
+        try:
+            entry_order = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' not in x['execInst']][0]
+        except IndexError:
+            entry_price = None
+        else:
+            entry_price = entry_order['price']
+            entryID = entry_order['orderID']
+        try:
+            stop_order = [x for x in my_orders if x['stopPx'] is not None and x['price'] is None and 'ReduceOnly' in x['execInst']][0]
+        except IndexError:
+            stop_price = None
+        else:
+            stop_price = stop_order['stopPx']
+            stopID = stop_order['orderID']
+        try:
+            target_order = [x for x in my_orders if x['price'] is not None and 'ReduceOnly' in x['execInst']][0]
+        except IndexError:
+            target_price = None
+        else:
+            target_price = target_order['price']
+            targetID = target_order['orderID']
+        alarm_types = []
+        if entry_price is not None:
+            alarm_types.append('Entry')
+        if stop_price is not None:
+            alarm_types.append('Stop')
+        if target_price is not None:
+            alarm_types.append('Target')
+        alarm = [list_prompt('Choose Alert Type', alarm_types+['All'])]
+        alarm_types = [x for x in alarm_types if x not in alarm]
+        if alarm[0] == 'All':
+            alarm = alarm_types
+        else:
+            while True:
+                if len(alarm_types) > 0:
+                    print('Set Another Alarm?')
+                    resp = y_n_prompt()
+                    if resp == 'No':
+                        alarm = alarm[0]
+                        break
+                    else:
+                        alarm.append(list_prompt('Choose Alert Type', alarm_types))
+                        alarm_types = [x for x in alarm_types if x not in alarm]
+                        continue
                 else:
-                    alarm.append(list_prompt('Choose Alert Type', alarm_types))
-                    alarm_types = [x for x in alarm_types if x not in alarm]
-                    continue
-            else:
-                break
-
-    target_alarm = False
-    stop_alarm = False
-    entry_alarm = False
-    if 'Target' in alarm:
-        target_price = [x['price'] for x in my_orders if x['price'] is not None and x['execInst'] == 'ReduceOnly'][0]
-        target_alarm = True
-    if 'Stop' in alarm:
-        stop_price = [x['stopPx'] for x in my_orders if x['stopPx'] is not None and x['price'] is None][0]
-        stop_alarm = True
-    if 'Entry' in alarm:
-        entry_price = [x['price'] for x in my_orders if x['price'] is not None and x['ordType'] == 'Limit' and x['execInst'] != 'ReduceOnly' and x['triggered'] == ''][0]
-        entry_alarm = True
-    current_price = ws.recent_trades()[-1]['price']
-    set_price = current_price
-    msg = symbol+' Alerts'+'\n'+'\n'+'Account: '+account+'\n'
-    msg += 'Current Price: '+usd_str(set_price)+'\n'
-    if entry_alarm:
-        msg += 'Entry Alarm Set at '+usd_str(entry_price)+'\n'
-    if target_alarm:
-        msg += 'Target Alarm Set at '+usd_str(target_price)+'\n'
-    if stop_alarm:
-        msg += 'Stop Alarm Set at '+usd_str(stop_price)
-    telegram_sendText(bot_credentials, msg)
-    ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=symbol, api_key=final_user['Bitmex']['api_key'], api_secret=final_user['Bitmex']['api_secret'])
-    while target_alarm or stop_alarm or entry_alarm:
-        current_price = ws.recent_trades()[-1]['price']
-        if target_alarm:
-            if target_price > set_price:
-                if current_price >= target_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                    target_alarm = False
-            else:
-                if current_price <= target_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Price Hit')
-                    target_alarm = False
-        if stop_alarm:
-            if stop_price > set_price:
-                if current_price >= stop_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                    stop_alarm = False
-            else:
-                if current_price <= stop_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Price Hit')
-                    stop_alarm = False
+                    break
+        target_alarm = False
+        stop_alarm = False
+        entry_alarm = False
+        if 'Entry' in alarm:
+            entry_alarm = True
+        if 'Stop' in alarm:
+            stop_alarm = True
+        if 'Target' in alarm:
+            target_alarm = True
+        current_price = [x['lastPrice'] for x in requests.get('https://www.bitmex.com/api/v1/instrument/active').json() if x['symbol'] == symbol][0]
+        msg = symbol+' Alerts'+'\n'+'\n'+'Account: '+account+'\n'
+        msg += 'Current Price: '+usd_str(current_price)+'\n'
         if entry_alarm:
-            if entry_price > set_price:
-                if current_price >= entry_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                    msg += results_str(current_open(symbol))
-                    telegram_sendText(bot_credentials, msg);
+            msg += 'Entry Alarm Set at '+usd_str(entry_price)+'\n'
+        if target_alarm:
+            msg += 'Target Alarm Set at '+usd_str(target_price)+'\n'
+        if stop_alarm:
+            msg += 'Stop Alarm Set at '+usd_str(stop_price)
+        telegram_sendText(bot_credentials, msg)
+        while target_alarm or stop_alarm or entry_alarm:
+            try:
+                my_orders = client.Order.Order_getOrders(reverse = True, filter = json.dumps({'symbol': symbol})).result()[0]
+            except bravado.exception.HTTPBadRequest:
+                continue
+            if len(my_orders) == 0:
+                target_alarm = False
+                stop_alarm = False
+                entry_alarm = False
+            if target_alarm:
+                target_status = [x for x in my_orders if x['orderID'] == targetID][0]['ordStatus']
+                if target_status == 'Filled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Order Filled')
+                    target_alarm = False
+                elif target_status == 'Canceled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Target Order Canceled')
+                    target_alarm = False
+            if stop_alarm:
+                stop_status = [x for x in my_orders if x['orderID'] == stopID][0]['ordStatus']
+                if stop_status == 'Filled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Order Filled')
+                    stop_alarm = False
+                elif stop_status == 'Canceled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Stop Order Canceled')
+                    stop_alarm = False
+            if entry_alarm:
+                entry_status = [x for x in my_orders if x['orderID'] == entryID][0]['ordStatus']
+                if entry_status == 'Filled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Order Filled')
                     entry_alarm = False
-            else:
-                if current_price <= entry_price:
-                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Price Hit')
-                    msg = 'Updated '+symbol+' Position'+'\n'+'\n'
-                    msg += results_str(current_open(symbol))
-                    telegram_sendText(bot_credentials, msg);
+                elif entry_status == 'Canceled':
+                    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Entry Order Canceled')
                     entry_alarm = False
-        time.sleep(0.2)
-        continue
-    telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Alerts Cleared')
-    return print('Account: '+account+'\n'+symbol+' Alerts Cleared')
+            time.sleep(1)
+        telegram_sendText(bot_credentials, 'Account: '+account+'\n'+symbol+' Alerts Cleared')
+        return print('Account: '+account+'\n'+symbol+' Alerts Cleared')
+    else:
+        return print('No Open Orders')
 
 
 print('Begin Risk Manager')
@@ -669,12 +733,12 @@ while True:
             resp = y_n_prompt()
             if resp == 'Yes':
                 try:
-                    price_alarms()
+                    set_alerts()
                 except KeyboardInterrupt:
-                    print('Alarms Canceled'+'\n'+'Exiting Program')
+                    print('Alarms Canceled')
             else:
                 print('Exiting Program')
-            break
+                break
         print('Exiting Program')
         break
     if os.path.exists(file) == False:
@@ -727,10 +791,11 @@ while True:
     null_orders = ['Deactivated', 'Cancelled', 'Filled']
 
     if exchange == 'Bitmex':
-        contracts = [x['symbol'] for x in client.Instrument.Instrument_getActive().result()[0] if 'XBT' in x['symbol']]
-        ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=contracts[0], api_key=final_user[exchange]['api_key'], api_secret=final_user[exchange]['api_secret'])
         while True:
-            step1_options = ['View/Manage Open Positions', 'Plan New Trade', 'Change Exchange/Account']
+            data = client.Position.Position_get(filter=json.dumps({'isOpen': True})).result()[0]
+            step1_options = ['Change Exchange/Account', 'Plan New Trade']
+            if len(data) > 0:
+                step1_options.append('View/Manage Open Positions')
             step1 = list_prompt('Choose Starting Option', step1_options)
             if step1 == 'Change Exchange/Account':
                 break
@@ -738,9 +803,13 @@ while True:
                 my_positions = all_open();
                 print('\n'+'Your Bitmex Open Positions'+'\n')
                 active_contracts = []
-                for x in range(len(my_positions)):
-                    print_dict(my_positions[x])
-                    active_contracts.append(my_positions[x]['Contract'])
+                if type(my_positions) == list:
+                    for x in range(len(my_positions)):
+                        print_dict(my_positions[x])
+                        active_contracts.append(my_positions[x]['Contract'])
+                else:
+                    print_dict(my_positions)
+                    active_contracts.append(my_positions['Contract'])
                 step2_options = ['Close Position', 'Amend Orders', 'Take Profit', 'Return to Start']
                 step2 = list_prompt('Choose an Option', step2_options)
                 if step2 != 'Return to Start':
@@ -748,15 +817,17 @@ while True:
                     if contract_to_view == 'Return to Start':
                         print('\n')
                         continue
-                    if contract_to_view != 'Return to Start':
-                        ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=contract_to_view, api_key=final_user[exchange]['api_key'], api_secret=final_user[exchange]['api_secret'])
                     if step2 == 'Close Position':
                         print('\n')
                         close_position(contract_to_view)
                         continue
                     elif step2 == 'Amend Orders':
                         print('\n')
-                        amend_order(contract_to_view)
+                        amend_position(contract_to_view)
+                        if bot:
+                            msg = 'Updated '+contract_to_view+' Position\n\n'
+                            msg += results_str(current_open(contract_to_view))
+                            telegram_sendText(bot_credentials, msg);
                         continue
                     elif step2 == 'Take Profit':
                         print('\n')
@@ -777,11 +848,16 @@ while True:
                             continue
                         else:
                             take_profit_order(contract_to_view, take_profit)
+                            if bot:
+                                msg = 'Updated '+contract_to_view+' Position\n\n'
+                                msg += results_str(current_open(contract_to_view))
+                                telegram_sendText(bot_credentials, msg);
                             continue
 
             elif step1 == 'Plan New Trade':
+                bitmex_data = requests.get('https://www.bitmex.com/api/v1/instrument/active').json()
+                contracts = [x['symbol'] for x in bitmex_data if 'XBT' in x['symbol']]
                 contract = list_prompt('Choose Contract to Trade', contracts)
-                ws = BitMEXWebsocket(endpoint='wss://www.bitmex.com/realtime', symbol=contract, api_key=final_user[exchange]['api_key'], api_secret=final_user[exchange]['api_secret'])
                 new_trade_data = new_trade_params(contract);
                 new_trade_data = position_size(new_trade_data);
                 new_trade_data = r_r(new_trade_data)
@@ -793,17 +869,15 @@ while True:
                     print('TRADE NOT EXECUTED'+'\n')
                     continue
                 else:
-                    close_position(new_trade_data['contract'])
+                    close_position(contract)
                     new_trade(new_trade_data)
                     if bot:
-                        while True:
-                            try:
-                                [x for x in ws.positions() if x['symbol'] == contract and x['isOpen'] == True][0]
-                            except IndexError:
-                                time.sleep(0.5)
-                                continue
-                        msg = 'Updated Position'+'\n'+'\n'
-                        msg+= results_str(current_open(new_trade_data['contract']))
+                        if new_trade_data['order_type'] == 'Market':
+                            msg = 'Updated '+contract+' Position\n\n'
+                            msg+= results_str(current_open(contract))
+                        else:
+                            msg = 'Updated '+contract+' Planned Trade\n\n'
+                            msg+= results_str(final_dict)
                         telegram_sendText(bot_credentials, msg);
                     continue
 
